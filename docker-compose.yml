@@ -1,0 +1,394 @@
+version: '3'
+
+networks:
+  traefik_network:
+    external: false
+
+volumes:
+  redis_data:
+
+services:
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/config:/etc/traefik
+      - ./traefik/certificates:/certificates
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.lunarprops.com`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=auth"
+      - "traefik.http.middlewares.auth.basicauth.users=admin:${DASHBOARD_PASS}"
+    command:
+      - "--api.insecure=false"
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/etc/traefik"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.email=${CF_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certificates/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+
+  cloudflare-ddns:
+    image: oznu/cloudflare-ddns
+    container_name: Cloudflare-DDNS
+    environment:
+      - API_KEY=${CF_API_KEY}
+      - ZONE=${CF_ZONE}
+      - PROXIED=true
+      - EMAIL=${CF_EMAIL}
+      - TZ=${TZ}
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: GluetunVPN
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - /mnt/user/appdata/gluetun:/gluetun:rw
+    environment:
+      - VPN_SERVICE_PROVIDER=airvpn
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=${VPN_USER}
+      - OPENVPN_PASSWORD=${VPN_PASSWORD}
+      - SERVER_REGIONS=Europe
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+    ports:
+      - "8388:8388/tcp"
+      - "8388:8388/udp"
+      - "8000:8000"
+      - "8888:8888"
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  postgres:
+    image: postgres:12.5-alpine
+    container_name: Postgres12.5
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/cache/appdata/postgres12-5/data:/var/lib/postgresql/data
+    ports:
+      - "5439:5432"
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  cloudflared-tunnel:
+    image: figro/unraid-cloudflared-tunnel
+    container_name: Unraid-Cloudflared-Tunnel
+    volumes:
+      - /mnt/user/appdata/cloudflared:/appdata:rw
+    environment:
+      - TZ=${TZ}
+      - TUNNEL_TOKEN=${CLOUDFLARED_TOKEN}
+      - TUNNEL_METRICS=0.0.0.0:46495
+    ports:
+      - "46495:46495"
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  ntp:
+    image: cturra/ntp
+    container_name: ntp
+    environment:
+      - NTP_SERVERS=${NTP_SERVERS}
+      - TZ=${TZ}
+    network_mode: host
+    restart: unless-stopped
+
+  # Continue with other services that use common environment variables
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    network_mode: "host"
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - VERSION=docker
+      - UMASK=022
+    volumes:
+      - /mnt/user/appdata/plex:/config
+      - /mnt/user/Video/TV:/tv
+      - /mnt/user/Video/Movies:/movies
+      - /mnt/user:/shares
+      - /dev/shm:/transcode
+    cpuset: "4,5,6,7,8,9,20,21,22,23,24,25"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          pids: 4096
+
+  traktarr:
+    image: eafxx/traktarr:latest
+    container_name: Traktarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - DELAY=2.5
+      - NOTIFICATIONS=yes
+      - BLACKLIST=yes
+      - NOSEARCH=yes
+      - RUNNOW=no
+      - SKIPUPDATE=no
+      - SORT=rating
+    volumes:
+      - /mnt/user/appdata/traktarr:/config:rw
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  radarr-movies:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr-movies
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/video:/video
+      - /mnt/user/appdata/radarr-movies:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.radarr-movies.rule=Host(`radarr-movies.lunarprops.com`)"
+      - "traefik.http.routers.radarr-movies.entrypoints=websecure"
+      - "traefik.http.routers.radarr-movies.tls.certresolver=letsencrypt"
+      - "traefik.http.services.radarr-movies.loadbalancer.server.port=7878"
+    restart: unless-stopped
+
+  radarr-anime:
+    image: lscr.io/linuxserver/radarr
+    container_name: radarr-anime
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/video:/video
+      - /mnt/user/appdata/radarr-anime:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.radarr-anime.rule=Host(`radarr-anime.lunarprops.com`)"
+      - "traefik.http.routers.radarr-anime.entrypoints=websecure"
+      - "traefik.http.routers.radarr-anime.tls.certresolver=letsencrypt"
+      - "traefik.http.services.radarr-anime.loadbalancer.server.port=7878"
+    restart: unless-stopped
+
+  sonarr-tv:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr-tv
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/video:/video
+      - /mnt/user/appdata/sonarr-tv:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sonarr-tv.rule=Host(`sonarr-tv.lunarprops.com`)"
+      - "traefik.http.routers.sonarr-tv.entrypoints=websecure"
+      - "traefik.http.routers.sonarr-tv.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sonarr-tv.loadbalancer.server.port=8989"
+    restart: unless-stopped
+
+  sonarr-anime:
+    image: lscr.io/linuxserver/sonarr
+    container_name: sonarr-anime
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/video:/video
+      - /mnt/user/appdata/sonarr-anime:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sonarr-anime.rule=Host(`sonarr-anime.lunarprops.com`)"
+      - "traefik.http.routers.sonarr-anime.entrypoints=websecure"
+      - "traefik.http.routers.sonarr-anime.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sonarr-anime.loadbalancer.server.port=8989"
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr
+    container_name: prowlarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/appdata/prowlarr:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prowlarr.rule=Host(`prowlarr.lunarprops.com`)"
+      - "traefik.http.routers.prowlarr.entrypoints=websecure"
+      - "traefik.http.routers.prowlarr.tls.certresolver=letsencrypt"
+      - "traefik.http.services.prowlarr.loadbalancer.server.port=9696"
+    restart: unless-stopped
+
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/appdata/jellyseerr:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jellyseerr.rule=Host(`jellyseerr.lunarprops.com`)"
+      - "traefik.http.routers.jellyseerr.entrypoints=websecure"
+      - "traefik.http.routers.jellyseerr.tls.certresolver=letsencrypt"
+      - "traefik.http.services.jellyseerr.loadbalancer.server.port=5055"
+    restart: unless-stopped
+
+  mdblistarr:
+    image: linaspurinis/mdblistarr:latest
+    container_name: mdblistarr
+    environment:
+      - TZ=${TZ}
+      - PORT=5353
+    volumes:
+      - /mnt/user/appdata/mdblistarr/db:/usr/src/db:rw
+    ports:
+      - "5353:5353"
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  redis:
+    image: redis
+    container_name: Redis
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  rclone-mount:
+    image: tynor88/rclone-mount:dev
+    container_name: rclone-mount
+    environment:
+      - TZ=${TZ}
+      - RCLONE_MOUNT_OPTIONS=--read-only
+      - RCLONE_REMOTE_MOUNT=google:
+    volumes:
+      - /mnt/cache/appdata/rclone:/config:rw
+      - /mnt/disks/rclone_volume/:/data:rw,shared
+    devices:
+      - /dev/fuse:/dev/fuse
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:latest
+    container_name: recyclarr
+    environment:
+      - TZ=${TZ}
+      - CRON_SCHEDULE=@daily
+      - RECYCLARR_CREATE_CONFIG=true
+    user: "99:100"
+    volumes:
+      - /mnt/cache/appdata/recyclarr:/config:rw
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  scrypted:
+    image: koush/scrypted:latest
+    container_name: scrypted
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/appdata/scrypted:/server/volume:rw
+      - /mnt/cache/nvr:/nvr:rw
+    network_mode: host
+    devices:
+      - /dev/dri:/dev/dri
+    restart: unless-stopped
+
+  traccar:
+    image: traccar/traccar:latest
+    container_name: traccar
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/appdata/traccar/logs:/opt/traccar/logs:rw
+      - /mnt/user/appdata/traccar/traccar.xml:/opt/traccar/conf/traccar.xml:rw
+    ports:
+      - "8082:8082"
+      - "21000-21150:5000-5150/tcp"
+      - "21000-21150:5000-5150/udp"
+    restart: unless-stopped
+    networks:
+      - traefik_network
+
+  transmission:
+    image: lscr.io/linuxserver/transmission:4.0.5
+    container_name: transmission
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/user/downloads:/downloads
+      - /mnt/user/appdata/transmission:/config
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.transmission.rule=Host(`transmission.lunarprops.com`)"
+      - "traefik.http.routers.transmission.entrypoints=websecure"
+      - "traefik.http.routers.transmission.tls.certresolver=letsencrypt"
+      - "traefik.http.services.transmission.loadbalancer.server.port=9091"
+    restart: unless-stopped
